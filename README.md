@@ -9,3 +9,114 @@ sudo apt install python3-distutils cython3 -y
 sudo apt install python3-psycopg2 python3-websockets python3-pika python3-numpy -y 
 
 sudo apt install supervisor nginx gunicorn3 -y 
+
+
+
+sudo sh -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ `lsb_release -c -s`-pgdg main' >> /etc/apt/sources.list.d/pgdg.list" 
+
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add - 
+
+sudo add-apt-repository ppa:timescale/timescaledb-ppa 
+
+sudo apt-get update 
+
+sudo apt install timescaledb-postgresql-11 -y 
+
+sudo timescaledb-tune --quiet --yes 
+
+sudo service postgresql restart 
+
+ 
+
+sudo -u postgres psql 
+
+SHOW data_directory; 
+
+CREATE USER admin WITH PASSWORD 'password'; 
+
+CREATE DATABASE darchive WITH OWNER admin; 
+
+\c darchive 
+
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE; 
+
+
+
+sudo -u postgres psql
+  CREATE USER admin WITH PASSWORD 'password';
+  CREATE DATABASE darchive WITH OWNER admin;
+  \c darchive
+  CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+上面的命令必须以数据库管理员身份执行
+首先创建访问数据库的用户，以及 darchive 表；后继再用该用户名密码创建 django Model
+
+开发环境中日常维护 —— 不需要重新创建用户
+  删除数据库
+    sudo -u postgres psql
+      drop database darchive;
+    删除之后可以观察到分配的 tablespace 目录也被清理 du -h /var/lib/postgresql/11/main/base
+  完全清理数据库之后直接使用如下命令
+    sudo -u postgres psql -c 'CREATE DATABASE darchive WITH OWNER admin'
+    sudo -u postgres psql --dbname=darchive -c 'CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE'
+  高级使用方法：创建一个 tablespace 来放置数据
+    mkdir /home/qyb/pgsql_data
+    sudo chown postgres:postgres /home/qyb/pgsql_data
+    sudo chmod 700 /home/qyb/pgsql_data
+    sudo -u postgres psql
+      CREATE TABLESPACE qyb_pgsql_data LOCATION '/home/qyb/pgsql_data';
+      CREATE DATABASE darchive WITH OWNER admin TABLESPACE qyb_pgsql_data;
+      \c darchive
+      CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+
+darchive 里表的使用规划如下：
+  Agent.exe   Archiver 虽然在监听 agent 队列，暂时并没有存储它们
+  Master      将从 xtask 得到的实际值存入 val_reals 和 val_bools 表、PGZ/QWZ 存入 expr_reals 表
+!! 注意：暂时 config 表已经没有任何实际用处，仅仅是 Agent.exe -p 的时候 select 一下做连接检查
+
+echo "
+CREATE TABLE config (
+  name        TEXT              NOT NULL PRIMARY KEY,
+  val         TEXT              NOT NULL
+);
+CREATE TABLE val_reals (
+  time        TIMESTAMPTZ       NOT NULL,
+  tag         TEXT              NOT NULL,
+  val         DOUBLE PRECISION  NULL
+);
+SELECT create_hypertable('val_reals', 'time');
+CREATE TABLE expr_reals (
+  time        TIMESTAMPTZ       NOT NULL,
+  tag         TEXT              NOT NULL,
+  val         DOUBLE PRECISION  NULL
+);
+SELECT create_hypertable('expr_reals', 'time');
+CREATE TABLE val_bools (
+  time        TIMESTAMPTZ       NOT NULL,
+  tag         TEXT              NOT NULL,
+  val         BOOL              NULL
+);
+SELECT create_hypertable('val_bools', 'time');
+CREATE INDEX ON val_reals (tag, time DESC);
+CREATE INDEX ON expr_reals (tag, time DESC);
+SELECT set_chunk_time_interval('val_reals', interval '30 minutes');
+SELECT set_chunk_time_interval('expr_reals', interval '30 minutes');
+SELECT set_chunk_time_interval('val_bools', interval '30 minutes');
+ALTER TABLE val_reals SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'tag'
+);
+SELECT add_compress_chunks_policy('val_reals', INTERVAL '30 minutes');
+ALTER TABLE expr_reals SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'tag'
+);
+SELECT add_compress_chunks_policy('expr_reals', INTERVAL '30 minutes');
+ALTER TABLE val_bools SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'tag'
+);
+SELECT add_compress_chunks_policy('val_bools', INTERVAL '30 minutes');
+SELECT add_drop_chunks_policy('val_reals', interval '31 days');
+SELECT add_drop_chunks_policy('expr_reals', interval '31 days');
+SELECT add_drop_chunks_policy('val_bools', interval '31 days');
+" | psql -h 127.0.0.1 -U admin -d darchive
